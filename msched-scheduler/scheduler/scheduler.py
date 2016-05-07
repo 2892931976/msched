@@ -4,6 +4,7 @@ import logging
 import uuid
 from collections import defaultdict
 from kazoo.recipe.watchers import ChildrenWatch
+from .lock import Lock
 
 
 class Scheduler:
@@ -39,12 +40,13 @@ class Scheduler:
 
     def copy_task_to_agent(self, task_id, target, task):
         target_node = os.path.join(self.root, 'tasks', task_id, 'targets', target)
-        lock = self.zk.Lock(target_node)
+        lock = Lock(self.zk, target_node)
         with lock:
             data = json.dumps(task)
             node = os.path.join(self.root, 'agents', target, 'tasks', task_id)
             try:
                 self.zk.create(node, data.encode('utf-8'))
+                self.zk.set(target_node, b'W')
             except Exception as e:
                 logging.error(e)
                 self.zk.set(target_node, b'F')
@@ -57,40 +59,27 @@ class Scheduler:
     def run(self, tasks):
         for task_id in tasks:
             self.schedule(task_id)
+        return True
 
     def schedule(self, task_id):
         node = os.path.join(self.root, 'tasks', task_id)
-        lock = self.zk.Lock(node)
-        with lock:
+        lock = Lock(self.zk, node)
+        try:
+            if not lock.acquire(False):
+                return
             task = self.get_task_info(task_id)
             status, targets = self.get_targets_status(task_id)
-            fail_rate = len(status.get('F')) / len(targets)
+            fail_rate = len(status['F']) / len(targets)
             if fail_rate > task.get('fail_rate', 0):
                 self.set_task_status(task_id, 'F')
-                return True
-
-            count = task.get('concurrent', 1) - (len(status.get('R')) + len(status['W']))
+                return
+            count = task.get('concurrent', 1) - (len(status['R']) + len(status['W']))
             can_schedule_count = min(count, len(status['N']))
             if can_schedule_count > 0:
-                schedule_list = list(status['N'])[:can_schedule_count - 1]
+                schedule_list = list(status['N'])[:can_schedule_count]
                 for target in schedule_list:
                     self.copy_task_to_agent(task_id, target, task)
             if len(status['N']) + len(status['W']) + len(status['R']) == 0:
                 self.set_task_status(task_id, 'S')
-        return True
-
-if __name__ == '__main__':
-    from kazoo.client import KazooClient
-    task = {
-        'job_id': 'test'
-    }
-    zk = KazooClient()
-    zk.start()
-    zk.ensure_path('/msched/agents/test/tasks')
-    zk.ensure_path('/msched/tasks/test')
-    zk.set('/msched/tasks/test', json.dumps(task).encode())
-    zk.ensure_path('/msched/tasks/test/targets/test')
-    zk.set('/msched/tasks/test/targets/test', b'N')
-    zk.ensure_path('/msched/signal/test')
-    sched = Scheduler(zk, 'msched')
-    sched.watch()
+        finally:
+            lock.release()
