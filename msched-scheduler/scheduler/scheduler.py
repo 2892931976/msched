@@ -2,17 +2,20 @@ import os
 import json
 import logging
 import uuid
+import threading
 from collections import defaultdict
+from kazoo.client import KazooClient
 from kazoo.recipe.watchers import ChildrenWatch
-from .lock import Lock
 
 
 class Scheduler:
-    def __init__(self, zk, root):
-        self.zk = zk
+    def __init__(self, hosts, root):
+        self.zk = KazooClient(hosts=hosts)
         self.root = root
+        self.event = threading.Event()
 
-    def watch(self):
+    def start(self):
+        self.zk.start()
         node = os.path.join(self.root, 'signal')
         ChildrenWatch(self.zk, node, self.run)
 
@@ -40,7 +43,8 @@ class Scheduler:
 
     def copy_task_to_agent(self, task_id, target, task):
         target_node = os.path.join(self.root, 'tasks', task_id, 'targets', target)
-        lock = Lock(self.zk, target_node)
+        lock_node = os.path.join(target_node, 'lock')
+        lock = self.zk.Lock(lock_node)
         with lock:
             data = json.dumps(task)
             node = os.path.join(self.root, 'agents', target, 'tasks', task_id)
@@ -57,13 +61,15 @@ class Scheduler:
         self.zk.create(node, status.encode())
 
     def run(self, tasks):
-        for task_id in tasks:
+        for task_id in set(tasks):
             self.schedule(task_id)
-        return True
+        return not self.event.is_set()
 
     def schedule(self, task_id):
         node = os.path.join(self.root, 'tasks', task_id)
-        lock = Lock(self.zk, node)
+        lock_node = os.path.join(node, 'lock')
+        self.zk.ensure_path(lock_node)
+        lock = self.zk.Lock(lock_node)
         try:
             if not lock.acquire(False):
                 return
@@ -83,3 +89,11 @@ class Scheduler:
                 self.set_task_status(task_id, 'S')
         finally:
             lock.release()
+
+    def join(self):
+        self.event.wait()
+
+    def shutdown(self):
+        self.event.set()
+        self.zk.stop()
+        self.zk.close()
