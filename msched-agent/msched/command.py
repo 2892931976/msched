@@ -41,6 +41,10 @@ class Command:
     def success(self):
         return self.proc is not None and self.proc.poll() == 0
 
+    @property
+    def finish(self):
+        return self.proc is not None and self.proc.poll() is not None
+
     def out_stream(self):
         if self.proc is None:
             raise Exception('not running')

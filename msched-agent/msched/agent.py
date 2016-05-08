@@ -2,11 +2,15 @@ import os
 import io
 import json
 import uuid
+import shutil
 import datetime
 import threading
 import random
 import zipfile
 import requests
+import pystache
+import logging
+import socket
 from kazoo.client import KazooClient
 from kazoo.recipe.watchers import ChildrenWatch
 from .command import Command
@@ -42,6 +46,46 @@ class Listener:
         node = os.path.join(self.root, 'job_server')
         return [self.zk.get(os.path.join(node, x))[0] for x in self.zk.get_children(node)]
 
+    def get_log_server_list(self):
+        node = os.path.join(self.root, 'log_server')
+        result = []
+        for server in self.zk.get_children(node):
+            address, port = server.split(':')
+            result.append((address, int(port)))
+        return result
+
+    def render(self, params):
+        for root, _, files in os.walk('.'):
+            for tmpl in [f for f in files if f.endswith('.tmpl')]:
+                path = os.path.join(root, tmpl)
+                with open(path, 'r') as f:
+                    content = f.read()
+                    rendered = pystache.render(content, params)
+                    with open(path.replace('.tmpl', ''), 'w') as w:
+                        w.write(rendered)
+
+    def _send_log(self, task_id, cmd, seq=1):
+        log_server = random.choice(self.get_log_server_list())
+        s = socket.socket()
+        s.connect(log_server)
+        s.send(task_id.encode())
+        s.send(b'\n')
+        s.send(self.hostname.encode())
+        s.send(b'\n')
+        s.send('{0}'.format(seq))
+        s.send(b'\n\n')
+        for buf in cmd.out_stream():
+            s.send(buf)
+        s.close()
+
+    def send_log(self, task_id, cmd):
+        seq = 1
+        while not cmd.finish:
+            t = threading.Thread(target=self._send_log, args=(task_id, cmd, seq))
+            t.start()
+            t.join()
+            seq += 1
+
     def schedule(self, task_id):
         task = self.get_task(task_id)
         job_server = random.choice(self.get_job_server_list())
@@ -52,13 +96,20 @@ class Listener:
         response = requests.get(url)
         z = zipfile.ZipFile(io.BytesIO(response.content))
         workspace = os.path.join(self.workspace, task_id)
+        os.makedirs(workspace)
         os.chdir(workspace)
         z.extractall()
+        try:
+            self.render(task.get('params', {}))
+        except Exception as e:
+            logging.error(e)
+            self.set_status(task_id, 'F')
+            return
         os.chmod('./run.sh', 0o755)
         cmd = Command('run.sh', workspace, timeout=task.get('timeout', 0))
         self.set_status(task_id, 'R')
         cmd.exec()
-        # TODO copy output stream to log server
+        self.send_log(task_id, cmd)
         cmd.wait()
         if cmd.success:
             self.set_status(task_id, 'S')
@@ -68,7 +119,11 @@ class Listener:
     def run(self):
         while not self.event.is_set():
             if len(self.tasks) > 0:
-                self.schedule(self.tasks.pop(0))
+                task_id = self.tasks.pop(0)
+                try:
+                    self.schedule(task_id)
+                finally:
+                    shutil.rmtree(os.path.join(self.workspace, task_id))
             else:
                 self.event.wait(1)
 
@@ -85,6 +140,7 @@ class Listener:
         self.zk.ensure_path(tasks_node)
         self.zk.create(os.path.join(node, 'alive'), str(datetime.datetime.now().timestamp()).encode(), ephemeral=True)
         ChildrenWatch(self.zk, tasks_node, self.watch)
+        threading.Thread(target=self.run, name='task-runner').start()
 
     def shutdown(self):
         self.event.set()
